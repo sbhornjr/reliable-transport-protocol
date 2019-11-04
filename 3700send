@@ -12,8 +12,12 @@ import json
 
 MSG_SIZE = 1500
 DATA_SIZE = 1000
-TIMEOUT = 30
+TIMEOUT = 5
 SEQUENCE = 0
+LAST_PACKET = {}
+SENT_TIME = 0
+FIRST = True
+OLD_RTT = 0
 
 # Bind to localhost and an ephemeral port
 IP_PORT = sys.argv[1]
@@ -25,14 +29,18 @@ dest = (UDP_IP, UDP_PORT)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
 sock.settimeout(TIMEOUT)
 
+
 def log(string):
   sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
 
+
 def send_next_packet():
   global SEQUENCE
+  global LAST_PACKET
+  global SENT_TIME
 
   data = sys.stdin.read(DATA_SIZE)
-  if (len(data) > 0):
+  if len(data) > 0:
     msg = json.dumps({"sequence": SEQUENCE, "data": data, "ack": False, "eof": False})
     assert (len(msg) <= 1472), "ERROR: Datagram is longer than 1472 bytes!!!"
     SEQUENCE += len(data)
@@ -41,35 +49,68 @@ def send_next_packet():
       log("[error] unable to fully send packet")
     else:
       log("[send data] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
+      SENT_TIME = datetime.datetime.now()
+      LAST_PACKET = json.loads(msg)
     return True
   else:
     return False
 
+
 # Send first packet
 send_next_packet()
+
 
 # Now read in data, send packets
 while True:
   log("ABOUT TO SLEEP")
-  result = sock.recvfrom(MSG_SIZE)
+  try:
+    result = sock.recvfrom(MSG_SIZE)
+    if result:
+      (data, addr) = result
+      try:
+        decoded = json.loads(data)
 
-  if result:
-    (data, addr) = result
-    try:
-      decoded = json.loads(data)
+        # If there is an ack, send next packet
+        if decoded['ack'] == SEQUENCE:
+          log("[recv ack] " + str(SEQUENCE))
+          current_time = datetime.datetime.now()
+          new_sample = current_time - SENT_TIME
+          new_sample = new_sample.total_seconds()
+          log("rtt was " + str(new_sample))
+          if FIRST:
+            FIRST = False
+            OLD_RTT = new_sample
+            TIMEOUT = new_sample * 2
+            log("new timeout is " + str(TIMEOUT))
+            sock.settimeout(TIMEOUT)
+          else:
+            if new_sample <= OLD_RTT / 2:
+              new_sample = OLD_RTT
+            new_rtt = .875 * OLD_RTT + (1 - 0.875) * new_sample
+            TIMEOUT = new_rtt * 2
+            log("new timeout is " + str(TIMEOUT))
+            sock.settimeout(TIMEOUT)
 
-      # If there is an ack, send next packet
-      if decoded['ack'] == SEQUENCE:
-        log("[recv ack] " + str(SEQUENCE))
-
-        # Try to send next packet; break if no more data
-        if (not send_next_packet()):
-          break
-    except (ValueError, KeyError, TypeError):
-      log("[recv corrupt packet]")
-  else:
+          # Try to send next packet; break if no more data
+          if not send_next_packet():
+            break
+        else:
+          log("[incorrect ack received] expected: " + str(SEQUENCE) + " received: " + decoded['ack'])
+      except (ValueError, KeyError, TypeError):
+        log("[recv corrupt packet]")
+  except socket.timeout:
     log("[error] timeout")
-    sys.exit(-1)
+    msg = LAST_PACKET
+    data = msg["data"]
+    msg = json.dumps(msg)
+    SSTHRESH = WINDOW / 2
+    WINDOW = 1
+
+    if sock.sendto(msg, dest) < len(msg):
+      log("[error] unable to fully send packet")
+    else:
+      log("[resending] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
+      SENT_TIME = datetime.datetime.now()
 
 sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
 sys.exit(0)

@@ -10,11 +10,16 @@ import datetime
 import select
 import json
 
+
 def log(string):
   sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
 
+
 MSG_SIZE = 1500
 TIMEOUT = 30
+LAST_PACKET = ""
+ADDR = ""
+SEQUENCE = -1
 
 # Bind to localhost and an ephemeral port
 UDP_IP = "127.0.0.1"
@@ -31,36 +36,43 @@ log("[bound] " + str(UDP_PORT))
 
 # Now listen for packets
 while True:
-  result = sock.recvfrom(MSG_SIZE)
+  try:
+    result = sock.recvfrom(MSG_SIZE)
+    if result:
+      (data, addr) = result
 
-  # If nothing is ready, we hit the timeout
-  if result:
-    (data, addr) = result
+      try:
+        decoded = json.loads(data)
 
-    try:
-      decoded = json.loads(data)
+        # If the EOF flag is set, exit
+        if decoded['eof']:
+          log("[completed]")
+          sys.exit(0)
 
-      # If the EOF flag is set, exit
-      if (decoded['eof']):
-        log("[completed]")
-        sys.exit(0)
+        # If there is data, we accept it and print it out
+        if decoded['data']:
 
-      # If there is data, we accept it and print it out
-      if (decoded['data']):
-        # If we receive data, we assume it's in-order
-        # You will need to do much more here
-        log("[recv data] " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
-        sys.stdout.write(decoded['data'])
+          # this is a duplicate reception/ack was dropped/out of order
+          if decoded['sequence'] <= SEQUENCE:
+            log("[recv data dupe] " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
 
-      # Send back an ack to the sender
-      msg = json.dumps({"ack": decoded['sequence'] + len(decoded['data'])})
-      log("ABOUT TO SEND " + msg)
-      if sock.sendto(msg, addr) < len(msg):
-        log("[error] unable to fully send packet")
+          else:
+            log("[recv data] " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
+            sys.stdout.write(decoded['data'])
+            SEQUENCE = decoded['sequence']
 
-    except (ValueError, KeyError, TypeError) as e:
-      log("[recv corrupt packet]")
-      raise e
-  else:
+        # Send back an ack to the sender
+        msg = json.dumps({"ack": decoded['sequence'] + len(decoded['data'])})
+        log("ABOUT TO SEND " + msg)
+        if sock.sendto(msg, addr) < len(msg):
+          log("[error] unable to fully send packet")
+        else:
+          LAST_PACKET = msg
+          ADDR = addr
+
+      except (ValueError, KeyError, TypeError) as e:
+        log("[recv corrupt packet]")
+        raise e
+  except socket.timeout:
     log("[error] timeout")
     sys.exit(-1)
