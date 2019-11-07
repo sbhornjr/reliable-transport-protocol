@@ -10,14 +10,23 @@ import datetime
 import select
 import json
 
-MSG_SIZE = 1500
-DATA_SIZE = 1000
-TIMEOUT = 5
-SEQUENCE = 0
-LAST_PACKET = {}
-SENT_TIME = 0
-FIRST = True
-OLD_RTT = 0
+# variables
+MSG_SIZE = 1500                 # size of msg
+DATA_SIZE = 1000                # amt of data read
+TIMEOUT = 1                     # socket timeout in seconds
+SEQUENCE = 0                    # current sequence number
+LAST_PACKET = {}                # last packet sent
+SENT_TIME = {}                  # dict containing sent times for each packet
+FIRST = True                    # is this still the first packet being sent/acked
+OLD_RTT = 0                     # the old round trip time
+WINDOW = 1                      # the current cwindow value
+SSTHRESH = 10                   # the ssthresh value
+SENT_UNACKED = 0                # how many sent packages are currently un-acked
+SCHEDULE = {}                   # the schedule of packets to be sent out indexed by sequence #
+LAST_ACK_RECEIVED = 0           # the last ack (sequence #) received
+NEXT_ACK_EXPECTED = DATA_SIZE   # the next ack (sequence #) expected
+MAX_KEY = 0                     # the max key in the schedule (max sequence #)
+NUM_DUPE_ACKS_RECEIVED = 0      # the number of consective duplicate acks received
 
 # Bind to localhost and an ephemeral port
 IP_PORT = sys.argv[1]
@@ -30,87 +39,209 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(TIMEOUT)
 
 
+# log function
 def log(string):
   sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
 
 
-def send_next_packet():
-  global SEQUENCE
-  global LAST_PACKET
-  global SENT_TIME
-
+# set up the schedule
+while True:
   data = sys.stdin.read(DATA_SIZE)
   if len(data) > 0:
     msg = json.dumps({"sequence": SEQUENCE, "data": data, "ack": False, "eof": False})
     assert (len(msg) <= 1472), "ERROR: Datagram is longer than 1472 bytes!!!"
     SEQUENCE += len(data)
-
-    if sock.sendto(msg, dest) < len(msg):
-      log("[error] unable to fully send packet")
-    else:
-      log("[send data] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
-      SENT_TIME = datetime.datetime.now()
-      LAST_PACKET = json.loads(msg)
-    return True
+    SCHEDULE[str(SEQUENCE)] = msg
   else:
+    MAX_KEY = SEQUENCE
+    SEQUENCE = 0
+    break
+
+
+# end - send EOF, exit
+def end():
+  sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+  sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+  sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+  sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
+  log("[completed]")
+  sys.exit(0)
+
+
+# send the next packet
+def send_next_packet():
+  global SEQUENCE
+  global LAST_PACKET
+  global SENT_TIME
+  global SENT_UNACKED
+  global SCHEDULE
+  global DATA_SIZE
+
+  # there are no more messages in the schedule, return false
+  if SEQUENCE > MAX_KEY:
     return False
+
+  msg = SCHEDULE[str(SEQUENCE)]
+
+  # send the next packet
+  if sock.sendto(msg, dest) < len(msg):
+    log("[error] unable to fully send packet")
+  else:
+    # packet sent; update sent time, last packet sent, # of packets sent unacked
+    log("[send data] " + str(SEQUENCE) + " (" + str(DATA_SIZE) + ")")
+    SENT_TIME[str(SEQUENCE)] = datetime.datetime.now()
+    LAST_PACKET = msg
+    SENT_UNACKED += 1
+  return True
+
+
+# receive an ack from the socket
+def receive_from_socket(result):
+  global SEQUENCE
+  global SSTHRESH
+  global WINDOW
+  global OLD_RTT
+  global SENT_UNACKED
+  global FIRST
+  global TIMEOUT
+  global LAST_ACK_RECEIVED
+  global NEXT_ACK_EXPECTED
+  global DATA_SIZE
+  global NUM_DUPE_ACKS_RECEIVED
+  global MAX_KEY
+
+  # whether an ack was received
+  received_ack = False
+
+  # the ack was given to this function
+  if result:
+    (data, addr) = result
+    received_ack = True
+  # no ack was given, check for ack
+  else:
+    try:
+      result = sock.recvfrom(MSG_SIZE)
+      # ack found
+      if result:
+        (data, addr) = result
+        received_ack = True
+    # no ack found - timeout
+    except socket.timeout:
+      log("[error] timeout")
+      msg = LAST_PACKET
+      msg = json.loads(msg)
+      data = msg["data"]
+      msg = json.dumps(msg)
+
+      # update SSTHRESH, WINDOW; re-send the last packet sent
+      SSTHRESH = WINDOW / 2
+      if SSTHRESH == 0:
+        SSTHRESH = 1
+      WINDOW = 1
+      if sock.sendto(msg, dest) < len(msg):
+        log("[error] unable to fully send packet")
+      else:
+        log("[send data] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
+        SENT_TIME[str(SEQUENCE)] = datetime.datetime.now()
+
+  # ack received
+  if received_ack:
+    decoded = json.loads(data)
+    recv_seq = decoded["ack"]
+
+    log("[recv ack] " + str(recv_seq))
+
+    # various statements for debugging purposes:
+    #log("SENT_UNACKED: " + str(SENT_UNACKED))
+    #log("NEXT_ACK_EXPECTED: " + str(NEXT_ACK_EXPECTED))
+    #log("NUM_DUPE_ACKS_RECEIVED: " + str(NUM_DUPE_ACKS_RECEIVED))
+    #log("LAST_ACK_RECEIVED: " + str(LAST_ACK_RECEIVED))
+    #log("SEQUENCE: " + str(SEQUENCE))
+    #log("SSTHRESH: " + str(SSTHRESH) + "WINDOW: " + str(WINDOW))
+
+    # duplicate ack received; increase dupe ack counter
+    if recv_seq == LAST_ACK_RECEIVED:
+      NUM_DUPE_ACKS_RECEIVED += 1
+      # 3 duplicate acks received; bring scheduler back to there
+      if NUM_DUPE_ACKS_RECEIVED >= 2:
+        SEQUENCE = recv_seq
+        NUM_DUPE_ACKS_RECEIVED = 0
+    # received the expected ack; increment last ack received and next ack expected
+    elif recv_seq == NEXT_ACK_EXPECTED:
+      NUM_DUPE_ACKS_RECEIVED = 0
+      LAST_ACK_RECEIVED = recv_seq
+      NEXT_ACK_EXPECTED = recv_seq + DATA_SIZE
+    # received an ack later than the one expected, ack must have been dropped
+    # trust the receiver and bring scheduler up to speed
+    elif recv_seq > NEXT_ACK_EXPECTED:
+      NUM_DUPE_ACKS_RECEIVED = 0
+      NEXT_ACK_EXPECTED = recv_seq + DATA_SIZE
+      LAST_ACK_RECEIVED = recv_seq
+      SEQUENCE = recv_seq + DATA_SIZE
+    # received the last ack - end
+    elif recv_seq == MAX_KEY:
+      end()
+    # any other scenario (e.g. received 2 acks ago again)
+    else:
+      NUM_DUPE_ACKS_RECEIVED = 0
+
+
+    SENT_UNACKED -= 1
+
+    # calculate round trip time, set new timeout, update window
+    current_time = datetime.datetime.now()
+    new_sample = current_time - SENT_TIME[str(recv_seq)]
+    new_sample = new_sample.total_seconds()
+    if FIRST:
+      FIRST = False
+      WINDOW += 1
+      OLD_RTT = new_sample
+      TIMEOUT = new_sample * 2
+      sock.settimeout(TIMEOUT)
+    else:
+      if WINDOW < SSTHRESH:
+        WINDOW += 1
+      #else:
+        #if SENT_UNACKED == 0:
+          #WINDOW += 1
+      if new_sample <= OLD_RTT / 2:
+          new_sample = OLD_RTT
+      new_rtt = .875 * OLD_RTT + (1 - 0.875) * new_sample
+      TIMEOUT = new_rtt * 2
+      sock.settimeout(TIMEOUT)
+
 
 
 # Send first packet
+SEQUENCE += DATA_SIZE
 send_next_packet()
 
 
 # Now read in data, send packets
 while True:
-  log("ABOUT TO SLEEP")
+  result = None
+  # see if there is an ack waiting for us
   try:
+    sock.settimeout(0.0001)
     result = sock.recvfrom(MSG_SIZE)
-    if result:
-      (data, addr) = result
-      try:
-        decoded = json.loads(data)
-
-        # If there is an ack, send next packet
-        if decoded['ack'] == SEQUENCE:
-          log("[recv ack] " + str(SEQUENCE))
-          current_time = datetime.datetime.now()
-          new_sample = current_time - SENT_TIME
-          new_sample = new_sample.total_seconds()
-          log("rtt was " + str(new_sample))
-          if FIRST:
-            FIRST = False
-            OLD_RTT = new_sample
-            TIMEOUT = new_sample * 2
-            log("new timeout is " + str(TIMEOUT))
-            sock.settimeout(TIMEOUT)
-          else:
-            if new_sample <= OLD_RTT / 2:
-              new_sample = OLD_RTT
-            new_rtt = .875 * OLD_RTT + (1 - 0.875) * new_sample
-            TIMEOUT = new_rtt * 2
-            log("new timeout is " + str(TIMEOUT))
-            sock.settimeout(TIMEOUT)
-
-          # Try to send next packet; break if no more data
-          if not send_next_packet():
-            break
-        else:
-          log("[incorrect ack received] expected: " + str(SEQUENCE) + " received: " + decoded['ack'])
-      except (ValueError, KeyError, TypeError):
-        log("[recv corrupt packet]")
+  # no ack waiting, proceed as normal
   except socket.timeout:
-    log("[error] timeout")
-    msg = LAST_PACKET
-    data = msg["data"]
-    msg = json.dumps(msg)
-    SSTHRESH = WINDOW / 2
-    WINDOW = 1
-
-    if sock.sendto(msg, dest) < len(msg):
-      log("[error] unable to fully send packet")
+    sock.settimeout(TIMEOUT)
+    # window allows us to send a packet - do this
+    if SENT_UNACKED < WINDOW:
+      SEQUENCE += DATA_SIZE
+      if not send_next_packet():
+        # the last ack received was the max - end
+        if LAST_ACK_RECEIVED == MAX_KEY:
+          end()
+        # we sent the last packet but haven't received an ack for it - go listen
+        else:
+          SEQUENCE = LAST_ACK_RECEIVED
+          receive_from_socket(result)
+    # window doesn't allow us to send a packet - listen for acks
     else:
-      log("[resending] " + str(SEQUENCE) + " (" + str(len(data)) + ")")
-      SENT_TIME = datetime.datetime.now()
-
-sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False}), dest)
-sys.exit(0)
+      receive_from_socket(result)
+  # there was an ack waiting - send it to receive_from_socket and process it
+  if result:
+    sock.settimeout(TIMEOUT)
+    receive_from_socket(result)

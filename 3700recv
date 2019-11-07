@@ -11,15 +11,19 @@ import select
 import json
 
 
+# log funtion
 def log(string):
   sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
 
 
-MSG_SIZE = 1500
-TIMEOUT = 30
-LAST_PACKET = ""
-ADDR = ""
-SEQUENCE = -1
+# variables
+MSG_SIZE = 1500             # msg size
+TIMEOUT = 30                # the socket timeout in seconds
+LAST_PACKET = ""            # the last packet received
+ADDR = ""                   # address of sender
+SEQUENCE = -1               # current sequence number (last acked)
+NEXT_SEQUENCE = 0           # next sequence # expected
+LAST_ACK = {}               # last ack message sent
 
 # Bind to localhost and an ephemeral port
 UDP_IP = "127.0.0.1"
@@ -38,11 +42,13 @@ log("[bound] " + str(UDP_PORT))
 while True:
   try:
     result = sock.recvfrom(MSG_SIZE)
+    # packet received
     if result:
       (data, addr) = result
 
       try:
         decoded = json.loads(data)
+        ooo = False   # out of order
 
         # If the EOF flag is set, exit
         if decoded['eof']:
@@ -52,17 +58,34 @@ while True:
         # If there is data, we accept it and print it out
         if decoded['data']:
 
-          # this is a duplicate reception/ack was dropped/out of order
+          # duplicate packet received
           if decoded['sequence'] <= SEQUENCE:
-            log("[recv data dupe] " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
+            log("[recv data] " + str(decoded['sequence'])
+                + " (" + str(len(decoded['data'])) + ") IGNORED")
+            ooo = True
 
+          # packet received out of order
+          elif decoded['sequence'] > NEXT_SEQUENCE:
+            log("[recv data] " + str(decoded['sequence'])
+                + " (" + str(len(decoded['data'])) + ") ACCEPTED (out-of-order)")
+            ooo = True
+
+          # correct packet received - write to stdout
           else:
-            log("[recv data] " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
+            log("[recv data] " + str(decoded['sequence'])
+                + " (" + str(len(decoded['data'])) + ") ACCEPTED (in-order)")
             sys.stdout.write(decoded['data'])
             SEQUENCE = decoded['sequence']
+            NEXT_SEQUENCE = decoded['sequence'] + 1000
 
         # Send back an ack to the sender
-        msg = json.dumps({"ack": decoded['sequence'] + len(decoded['data'])})
+        # out of order, send last ack again
+        if ooo:
+          msg = LAST_ACK
+        # correct order, send new ack
+        else:
+          msg = json.dumps({"ack": decoded['sequence'] + len(decoded['data'])})
+        LAST_ACK = msg
         log("ABOUT TO SEND " + msg)
         if sock.sendto(msg, addr) < len(msg):
           log("[error] unable to fully send packet")
